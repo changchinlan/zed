@@ -168,7 +168,7 @@ impl WslRemoteConnection {
     async fn detect_shell(&self) -> Result<String> {
         const DEFAULT_SHELL: &str = "sh";
         match self
-            .run_wsl_command_with_output("sh", &["-c", "echo $SHELL"])
+            .run_wsl_login_shell_command_with_output("sh", &["-c", "echo $SHELL"])
             .await
         {
             Ok(output) => Ok(parse_shell(&output, DEFAULT_SHELL)),
@@ -199,6 +199,27 @@ impl WslRemoteConnection {
 
     async fn run_wsl_command_with_output(&self, program: &str, args: &[&str]) -> Result<String> {
         run_wsl_command_with_output_impl(&self.connection_options, program, args).await
+    }
+
+    /// Runs a command through the distro's login shell, never through `--exec`.
+    ///
+    /// Only useful for reading the environment the login shell sets up. A
+    /// wrapped shell is invisible from the outside: NixOS-WSL points
+    /// `/etc/passwd` at a wrapper binary and the wrapper rewrites `$SHELL` to
+    /// the shell it is about to launch, so `--exec` reports the wrapper path
+    /// while the login shell reports the real shell.
+    async fn run_wsl_login_shell_command_with_output(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<String> {
+        run_wsl_command_impl(wsl_command_impl(
+            &self.connection_options,
+            program,
+            args,
+            false,
+        ))
+        .await
     }
 
     async fn run_wsl_command(&self, program: &str, args: &[&str]) -> Result<()> {
