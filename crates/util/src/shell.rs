@@ -139,6 +139,23 @@ pub fn get_windows_system_shell() -> String {
     return "cmd.exe".to_string();
 }
 
+/// Recovers the shell name from a Nix shell wrapper path.
+///
+/// Nix wraps executables in a derivation of its own, and the wrapper is always
+/// installed under the same name, so the file name carries no information about
+/// what it launches. NixOS-WSL uses this to wrap the user's login shell, which
+/// leaves `/etc/passwd` (and therefore `$SHELL`) pointing at
+/// `/nix/store/<hash>-wrapped-nu/wrapper` for a Nushell user. The derivation
+/// name still holds the answer, so read it from the parent directory.
+fn nix_wrapped_shell(path: &Path, file_stem: &str) -> Option<String> {
+    if file_stem != "wrapper" {
+        return None;
+    }
+    let derivation = path.parent()?.file_name()?.to_string_lossy();
+    let (_hash, wrapped) = derivation.split_once("-wrapped-")?;
+    Some(wrapped.to_owned())
+}
+
 impl fmt::Display for ShellKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -203,11 +220,15 @@ impl ShellKind {
     }
 
     pub fn new(program: impl AsRef<Path>, is_windows: bool) -> Self {
-        let program = program.as_ref();
-        let program = program
+        let path = program.as_ref();
+        let program = path
             .file_stem()
-            .unwrap_or_else(|| program.as_os_str())
+            .unwrap_or_else(|| path.as_os_str())
             .to_string_lossy();
+        let program = match nix_wrapped_shell(path, &program) {
+            Some(wrapped) => Cow::Owned(wrapped),
+            None => program,
+        };
 
         match &*program {
             "powershell" => ShellKind::PowerShell,
@@ -787,6 +808,31 @@ mod tests {
     // nu -c overlay use "C:\Users\kubko\dev\python\39007\tests\.venv\Scripts\activate.nu"; ^"C:\Program Files\PowerShell\7\pwsh.exe" -C "C:\Users\kubko\dev\python\39007\tests\.venv\Scripts\python.exe -m pytest \"test_foo.py::test_foo\""
     // PowerShell from CMD
     // cmd /C \" \"C:\\\\Users\\\\kubko\\\\dev\\\\python\\\\39007\\\\tests\\\\.venv\\\\Scripts\\\\activate.bat\"& \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -C \"C:\\\\Users\\\\kubko\\\\dev\\\\python\\\\39007\\\\tests\\\\.venv\\\\Scripts\\\\python.exe -m pytest \\\"test_foo.py::test_foo\\\"\"\"
+
+    #[test]
+    fn test_shell_kind_of_nix_wrapped_shell() {
+        assert_eq!(
+            ShellKind::new(
+                "/nix/store/66z5n1jix1fjhdnzy6llyqhw3l00afcr-wrapped-nu/wrapper",
+                false
+            ),
+            ShellKind::Nushell
+        );
+        assert_eq!(
+            ShellKind::new(
+                "/nix/store/66z5n1jix1fjhdnzy6llyqhw3l00afcr-wrapped-fish/wrapper",
+                false
+            ),
+            ShellKind::Fish
+        );
+        // An unwrapped shell keeps working, and so does a `wrapper` that has
+        // nothing to do with Nix.
+        assert_eq!(
+            ShellKind::new("/run/current-system/sw/bin/nu", false),
+            ShellKind::Nushell
+        );
+        assert_eq!(ShellKind::new("/usr/local/bin/wrapper", false), ShellKind::Posix);
+    }
 
     #[test]
     fn test_try_quote_powershell() {
