@@ -588,12 +588,47 @@ impl RemoteConnection for WslRemoteConnection {
             .map(|working_dir| RemotePathBuf::new(working_dir, PathStyle::Unix).to_string())
             .unwrap_or("~".to_string());
 
-        let mut exec = String::from("exec env ");
+        // The environment travels in `wsl.exe`'s own environment block rather
+        // than on the command line. `WSLENV` names the variables WSL copies
+        // into the distro, and `/u` means "only on the way in, and do not
+        // translate the value". Spelling the environment out on the command
+        // line instead runs into the 32767 character limit `CreateProcess`
+        // puts on a command line, which a Nix or direnv environment exceeds on
+        // its own.
+        let mut wsl_env = HashMap::default();
+        let mut wslenv = std::env::var("WSLENV").unwrap_or_default();
+        for key in env.keys() {
+            // WSL always composes `PATH` itself, out of the distro default and
+            // the translated Windows `PATH`, so it is the one variable `WSLENV`
+            // cannot carry. It is passed on the command line below.
+            if key == "PATH" {
+                continue;
+            }
+            if !wslenv.is_empty() {
+                wslenv.push(':');
+            }
+            write!(wslenv, "{key}/u")?;
+        }
+        wsl_env.extend(
+            env.iter()
+                .filter(|(key, _)| *key != "PATH")
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        wsl_env.insert("WSLENV".to_string(), wslenv);
 
-        for (key, value) in env.iter() {
-            let assignment = format!("{key}={value}");
-            let assignment = shell_kind.try_quote(&assignment).context("shell quoting")?;
-            write!(exec, "{assignment} ")?;
+        let mut exec = String::from("exec ");
+
+        if let Some(path) = env.get("PATH") {
+            let assignment = format!("PATH={path}");
+            // `env` is spelled without a command prefix because it is the
+            // argument of `exec`, which resolves it as an external command on
+            // its own. Nushell reads a prefixed `^env` there as the command
+            // name itself and fails to find it.
+            write!(
+                exec,
+                "env {} ",
+                shell_kind.try_quote(&assignment).context("shell quoting")?
+            )?;
         }
 
         if let Some(program) = program {
@@ -640,7 +675,7 @@ impl RemoteConnection for WslRemoteConnection {
         Ok(CommandTemplate {
             program: "wsl.exe".to_string(),
             args: wsl_args,
-            env: HashMap::default(),
+            env: wsl_env,
         })
     }
 
