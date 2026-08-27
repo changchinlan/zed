@@ -496,6 +496,7 @@ impl RemoteConnection for WslRemoteConnection {
             }
         }
 
+        proxy_args.insert(0, "env".to_owned());
         proxy_args.push(remote_binary_path.display(PathStyle::Unix).into_owned());
         proxy_args.push("proxy".to_owned());
         proxy_args.push("--identifier".to_owned());
@@ -505,8 +506,18 @@ impl RemoteConnection for WslRemoteConnection {
             proxy_args.push("--reconnect".to_owned());
         }
 
+        // The server runs through the distro login shell, not `--exec`. The
+        // login shell is where the environment a project is meant to build on
+        // comes from: on NixOS-WSL it is a wrapper that both rewrites `$SHELL`
+        // to the shell it launches and brings in the Nix profile entries of
+        // `PATH`. Started with `--exec`, the server sees neither, and the
+        // environment capture it performs for terminals and tasks then runs a
+        // shell whose own configuration fails on the missing `PATH`.
+        //
+        // `exec` keeps the login shell from staying around as a parent of the
+        // server, so terminating the proxy still terminates the server.
         let proxy_process =
-            match wsl_command_impl(&self.connection_options, "env", &proxy_args, true)
+            match wsl_command_impl(&self.connection_options, "exec", &proxy_args, false)
                 .kill_on_drop(true)
                 .spawn()
             {
