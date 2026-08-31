@@ -1161,6 +1161,37 @@ pub(crate) struct InputRateTracker {
     sustain_duration: Duration,
 }
 
+const THIRTY_FPS_INTERVAL: Duration = Duration::from_micros(33333);
+const SIXTY_FPS_INTERVAL: Duration = Duration::from_micros(16667);
+const FRAME_INTERVAL_TOLERANCE: Duration = Duration::from_millis(1);
+
+/// Display-link timestamps can straddle a target interval by fractions of a
+/// millisecond. Accepting that callback preserves an even display-frame divisor
+/// instead of occasionally waiting for an additional refresh.
+fn frame_request_arrived_too_early(elapsed: Duration, minimum_interval: Duration) -> bool {
+    elapsed < minimum_interval.saturating_sub(FRAME_INTERVAL_TOLERANCE)
+}
+
+fn minimum_frame_interval(
+    frame_requested: bool,
+    inactive_without_high_rate_input: bool,
+    thermal_state: ThermalState,
+    low_power_mode_enabled: bool,
+) -> Option<Duration> {
+    if !frame_requested {
+        None
+    } else if inactive_without_high_rate_input || low_power_mode_enabled {
+        Some(THIRTY_FPS_INTERVAL)
+    } else if matches!(
+        thermal_state,
+        ThermalState::Critical | ThermalState::Serious
+    ) {
+        Some(SIXTY_FPS_INTERVAL)
+    } else {
+        None
+    }
+}
+
 impl Default for InputRateTracker {
     fn default() -> Self {
         Self {
@@ -1583,33 +1614,41 @@ impl Window {
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
+                let power_state = handle
+                    .update(&mut cx, |_, _, cx| {
+                        (cx.thermal_state(), cx.low_power_mode_enabled())
+                    })
                     .log_err();
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
+                // - Low power mode: cap to ~30fps
                 // - Inactive window (not focused): cap to ~30fps to save energy,
                 //   unless input is arriving at a high rate (e.g. scrolling an
                 //   unfocused window, which is delivered to the window under
                 //   the pointer).
-                let min_frame_interval = if !force_render
-                    && !request_frame_options.require_presentation
-                    && next_frame_callbacks.borrow().is_empty()
-                {
-                    None
-                } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
-                    Some(Duration::from_micros(33333))
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
-                    Some(Duration::from_micros(16667))
-                } else {
-                    None
-                };
+                let frame_requested = force_render
+                    || request_frame_options.require_presentation
+                    || !next_frame_callbacks.borrow().is_empty();
+                let inactive_without_high_rate_input = frame_requested
+                    && !active.get()
+                    && !input_rate_tracker.borrow_mut().is_high_rate();
+                let (thermal_state, low_power_mode_enabled) =
+                    power_state.unwrap_or((ThermalState::Nominal, false));
+                let min_frame_interval = minimum_frame_interval(
+                    frame_requested,
+                    inactive_without_high_rate_input,
+                    thermal_state,
+                    low_power_mode_enabled,
+                );
 
                 let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
-                        && now.duration_since(last_frame) < min_interval
+                        && frame_request_arrived_too_early(
+                            now.duration_since(last_frame),
+                            min_interval,
+                        )
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
@@ -6670,13 +6709,45 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     use crate::{
         AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement, Pixels, Render, Styled, TestAppContext, Window, WindowOptions, canvas, div,
-        px, size,
+        ParentElement, Pixels, Render, Styled, TestAppContext, ThermalState, Window, WindowOptions,
+        canvas, div, px, size,
     };
+
+    #[test]
+    fn frame_throttle_accepts_display_link_rounding() {
+        assert!(!super::frame_request_arrived_too_early(
+            Duration::from_micros(16_666),
+            super::SIXTY_FPS_INTERVAL,
+        ));
+        assert!(!super::frame_request_arrived_too_early(
+            Duration::from_micros(33_332),
+            super::THIRTY_FPS_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn frame_throttle_rejects_an_extra_display_refresh() {
+        assert!(super::frame_request_arrived_too_early(
+            Duration::from_micros(8_333),
+            super::SIXTY_FPS_INTERVAL,
+        ));
+        assert!(super::frame_request_arrived_too_early(
+            Duration::from_micros(16_666),
+            super::THIRTY_FPS_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn low_power_mode_throttles_active_windows_to_thirty_fps() {
+        assert_eq!(
+            super::minimum_frame_interval(true, false, ThermalState::Nominal, true),
+            Some(super::THIRTY_FPS_INTERVAL)
+        );
+    }
 
     struct EmptyView;
 
