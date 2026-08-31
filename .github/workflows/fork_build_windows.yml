@@ -1,0 +1,81 @@
+# Builds a Windows binary from the nix-wsl branch, which carries the patches for
+# opening a NixOS-WSL distro as a remote. This is not an upstream workflow:
+# upstream's Windows jobs run on self-32vcpu-windows-2022 runners that only exist
+# in the Zed organization, so this one targets a GitHub-hosted runner instead.
+#
+# The build is a dev-channel Zed. A dev build expects the remote server at
+# ~/.zed_server/zed-remote-server-dev-build and has no release to download it
+# from, so this workflow also builds a static musl remote_server to put there.
+#
+# Manual trigger only. A cold build on a 4-vCPU runner takes a couple of hours,
+# which is fine for the case it exists for: rebase onto upstream, start a run,
+# collect the binaries whenever it finishes.
+name: Build Windows binary (fork)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # windows-2025 is the Visual Studio 2026 image, which carries the
+    # Spectre-mitigated C++ libraries that msvc_spectre_libs requires.
+    runs-on: windows-2025
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: 0
+      # The release profile builds with debug = "limited", which is most of the
+      # 446 MB of the resulting exe. Nothing here symbolicates minidumps.
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the version, so let rustup act on it rather
+      # than installing a toolchain of our own.
+      - run: rustup show
+
+      # target/ is 11 GB, well past the 10 GB per-repository cache limit, so
+      # only the registry is worth caching.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - run: cargo build --release -p zed -p cli --target x86_64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-x86_64
+          path: |
+            target/x86_64-pc-windows-msvc/release/zed.exe
+            target/x86_64-pc-windows-msvc/release/cli.exe
+          if-no-files-found: error
+
+  remote-server:
+    # Same build as upstream's check_remote_server_linux_x86_64 job, with
+    # bundle-linux's release profile.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CC: clang
+      CXX: clang++
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: ./script/linux
+
+      - run: rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - run: cargo --config .cargo/bundle-config.toml build --release --package remote_server --target x86_64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/remote_server
+          if-no-files-found: error
